@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import * as os from 'node:os';
 import fsExtra from 'fs-extra';
 import { randomBytes } from 'node:crypto';
+import { v4 as generateAccountId } from 'uuid';
 import { createParser } from 'dashdash';
 
 import fastGlob from 'fast-glob';
@@ -69,6 +70,20 @@ import {
 // Very important to put before the single instance check, since it is based on the
 //   userData directory. (see requestSingleInstanceLock below)
 import * as userConfig from './user_config.main.ts';
+
+// Multi-account support
+import {
+  getAllAccounts,
+  getActiveAccount,
+  getAccountById,
+  setActiveAccount,
+  updateAccount,
+  addAccount,
+  removeAccount,
+  ensureDefaultAccountRegistered,
+  notifyActiveAccountRegistered,
+} from '../ts/accounts/accountRegistry.main.ts';
+import type { AccountEntry } from '../ts/accounts/accountRegistry.main.ts';
 
 // We generally want to pull in our own modules after this point, after the user
 //   data directory has been set.
@@ -303,8 +318,30 @@ if (!gotLock) {
 let sqlInitTimeStart = 0;
 let sqlInitTimeEnd = 0;
 
-const sql = new MainSQL();
+// Active account's SQL instance — updated when switching accounts.
+// Module-level so existing code (zoomFactorService, getIsLinked, etc.) still works.
+let sql: MainSQL = undefined as unknown as MainSQL;
+
+// Multi-window account state
+type AccountWindowEntry = { window: BrowserWindow; sql: MainSQL };
+const accountWindows = new Map<string, AccountWindowEntry>();
+const webContentsToAccount = new Map<number, string>();
+let activeAccountId = '';
+// Guards against overlapping account switches racing on the same SQLite file.
+let accountSwitchInProgress = false;
+
+// Per-window SQL init promises keyed by webContentsId, for database-ready routing
+const sqlInitPromises = new Map<
+  number,
+  Promise<{ ok: true; error: undefined } | { ok: false; error: Error }>
+>();
+
 const heicConverter = getHeicConverter();
+
+// Module-level userDataPath, set in app.on('ready').
+// Needed by multi-account functions (performAccountSwitch, performAccountAdd)
+// which are declared at module scope but run after ready.
+let userDataPath = '';
 
 async function getSpellCheckSetting(): Promise<boolean> {
   const value = ephemeralConfig.get('spell-check');
@@ -675,7 +712,9 @@ async function safeLoadURL(window: BrowserWindow, url: string): Promise<void> {
   }
 }
 
-async function createWindow() {
+async function createWindow(opts: { sess?: Electron.Session } = {}) {
+  const sess = opts.sess ?? session.defaultSession;
+
   const primaryDisplay = screen.getPrimaryDisplay();
   const { width: maxWidth, height: maxHeight } = primaryDisplay.workAreaSize;
   const width = windowConfig
@@ -715,6 +754,7 @@ async function createWindow() {
       nodeIntegrationInWorker: false,
       sandbox: false,
       contextIsolation: !isTestEnvironment(getEnvironment()),
+      session: sess,
       preload: isTestEnvironment(getEnvironment())
         ? join(rootDir, 'ts', 'windows', 'main', 'tsx.preload.js')
         : join(rootDir, 'bundles', 'preload', 'wrapper.js'),
@@ -769,6 +809,9 @@ async function createWindow() {
   if (settingsChannel) {
     settingsChannel.setMainWindow(mainWindow);
   }
+
+  // Capture webContentsId now — it's still valid inside the 'closed' handler.
+  const createdWindowWebContentsId = mainWindow.webContents.id;
 
   mainWindowCreated = true;
   setupSpellChecker(
@@ -959,7 +1002,16 @@ async function createWindow() {
     await requestShutdown();
     windowState.markReadyForShutdown();
 
-    await sql.close();
+    // Close SQL for all account windows
+    await Promise.all(
+      Array.from(accountWindows.values()).map(({ sql: s }) =>
+        s
+          .close()
+          .catch(err =>
+            log.error('sql.close error during quit:', Errors.toLogFormat(err))
+          )
+      )
+    );
     app.quit();
   });
 
@@ -969,6 +1021,22 @@ async function createWindow() {
     // in an array if your app supports multi windows, this is the time
     // when you should delete the corresponding element.
     log.info('main window closed event');
+
+    // Clean up multi-account maps for this window. Resolve the account from the
+    // window's own webContentsId rather than the module-level activeAccountId,
+    // which may already point at a different account if a switch raced ahead of
+    // this 'closed' event.
+    const closedAccountId = webContentsToAccount.get(
+      createdWindowWebContentsId
+    );
+    sqlChannels.unregisterWindow(createdWindowWebContentsId);
+    attachmentChannel.unregisterWindow(createdWindowWebContentsId);
+    webContentsToAccount.delete(createdWindowWebContentsId);
+    if (closedAccountId !== undefined) {
+      accountWindows.delete(closedAccountId);
+    }
+    sqlInitPromises.delete(createdWindowWebContentsId);
+
     mainWindow = undefined;
     if (settingsChannel) {
       settingsChannel.setMainWindow(mainWindow);
@@ -1047,14 +1115,16 @@ async function createWindow() {
   );
 }
 
-// Renderer asks if we are done with the database
-ipc.handle('database-ready', async () => {
-  if (!sqlInitPromise) {
+// Renderer asks if we are done with the database.
+// Routes by webContentsId so each account window waits for its own SQL init.
+ipc.handle('database-ready', async event => {
+  const promise = sqlInitPromises.get(event.sender.id) ?? sqlInitPromise;
+  if (!promise) {
     log.error('database-ready requested, but sqlInitPromise is falsey');
     return;
   }
 
-  const { error } = await sqlInitPromise;
+  const { error } = await promise;
   if (error) {
     log.error(
       'database-ready requested, but got sql error',
@@ -1603,12 +1673,12 @@ function showPermissionsPopupWindow(forCalling: boolean, forCamera: boolean) {
   });
 }
 
-const runSQLCorruptionHandler = async () => {
+async function runSQLCorruptionHandler(instanceSql: MainSQL): Promise<void> {
   // This is a glorified event handler. Normally, this promise never resolves,
   // but if there is a corruption error triggered by any query that we run
   // against the database - the promise will resolve and we will call
   // `onDatabaseInitializationError`.
-  const error = await sql.whenCorrupted();
+  const error = await instanceSql.whenCorrupted();
 
   log.error(
     'Detected sql corruption in main process. ' +
@@ -1616,19 +1686,19 @@ const runSQLCorruptionHandler = async () => {
   );
 
   await onDatabaseInitializationError(error);
-};
+}
 
-const runSQLReadonlyHandler = async () => {
+async function runSQLReadonlyHandler(instanceSql: MainSQL): Promise<void> {
   // This is a glorified event handler. Normally, this promise never resolves,
   // but if there is a corruption error triggered by any query that we run
   // against the database - the promise will resolve and we will call
   // `onDatabaseInitializationError`.
-  const error = await sql.whenReadonly();
+  const error = await instanceSql.whenReadonly();
 
   log.error(`Detected readonly sql database in main process: ${error.message}`);
 
   throw error;
-};
+}
 
 function generateSQLKey(): string {
   log.info(
@@ -1785,20 +1855,78 @@ function handleSafeStorageDecryptionError(): 'continue' | 'quit' {
   return 'continue';
 }
 
+/**
+ * Get (or generate) the SQL encryption key for a per-account data directory.
+ * Unlike getSQLKey(), this uses a simple account-key.json file within the
+ * account directory rather than the global userConfig, since per-account
+ * directories have no legacy migration to worry about.
+ */
+function getAccountSQLKey(accountPath: string): string {
+  const isLinux = OS.isLinux();
+  const safeStorageBackend: string | undefined = isLinux
+    ? safeStorage.getSelectedStorageBackend()
+    : undefined;
+  const isEncryptionAvailable =
+    (app.isPackaged ||
+      (!process.env.GENERATE_PRELOAD_CACHE &&
+        !isTestEnvironment(getEnvironment()))) &&
+    safeStorage.isEncryptionAvailable() &&
+    (!isLinux || safeStorageBackend !== 'basic_text');
+
+  const keyFilePath = join(accountPath, 'account-key.json');
+
+  if (fsExtra.existsSync(keyFilePath)) {
+    const raw = fsExtra.readFileSync(keyFilePath, 'utf8');
+    const parsed = JSON.parse(raw) as { encrypted?: string; key?: string };
+    if (parsed.encrypted != null) {
+      return safeStorage.decryptString(Buffer.from(parsed.encrypted, 'base64'));
+    }
+    if (parsed.key != null) {
+      return parsed.key;
+    }
+    throw new Error('getAccountSQLKey: invalid key file format');
+  }
+
+  // Owner-only directory; the key file holds (or, in the plaintext fallback,
+  // *is*) the SQLCipher key, so keep it out of reach of other local users.
+  fsExtra.mkdirSync(accountPath, { recursive: true, mode: 0o700 });
+  const key = generateSQLKey();
+  if (isEncryptionAvailable) {
+    const encrypted = safeStorage.encryptString(key).toString('base64');
+    fsExtra.writeFileSync(keyFilePath, JSON.stringify({ encrypted }), {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+  } else {
+    log.info(
+      'getAccountSQLKey: safeStorage unavailable, storing key as plaintext'
+    );
+    fsExtra.writeFileSync(keyFilePath, JSON.stringify({ key }), {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+  }
+  // Enforce perms even if the file already existed with looser bits.
+  fsExtra.chmodSync(keyFilePath, 0o600);
+  return key;
+}
+
 async function initializeSQL(
-  userDataPath: string
+  instanceSql: MainSQL,
+  configDir: string,
+  existingKey?: string
 ): Promise<{ ok: true; error: undefined } | { ok: false; error: Error }> {
   sqlInitTimeStart = Date.now();
 
   let key: string;
   try {
-    key = getSQLKey();
+    key = existingKey ?? getSQLKey();
   } catch (error) {
     try {
       // Initialize with *some* key to setup paths
-      await sql.initialize({
+      await instanceSql.initialize({
         appVersion: app.getVersion(),
-        configDir: userDataPath,
+        configDir,
         key: 'abcd',
         logger: log,
       });
@@ -1818,11 +1946,11 @@ async function initializeSQL(
 
   try {
     // This should be the first awaited call in this function, otherwise
-    // `sql.sqlRead` will throw an uninitialized error instead of waiting for
-    // init to finish.
-    await sql.initialize({
+    // `instanceSql.sqlRead` will throw an uninitialized error instead of
+    // waiting for init to finish.
+    await instanceSql.initialize({
       appVersion: app.getVersion(),
-      configDir: userDataPath,
+      configDir,
       key,
       logger: log,
     });
@@ -1840,13 +1968,13 @@ async function initializeSQL(
     sqlInitTimeEnd = Date.now();
   }
 
-  sql.startTrackingQueryStats();
+  instanceSql.startTrackingQueryStats();
 
   // Only if we've initialized things successfully do we set up the corruption handler
-  drop(runSQLCorruptionHandler());
-  drop(runSQLReadonlyHandler());
+  drop(runSQLCorruptionHandler(instanceSql));
+  drop(runSQLReadonlyHandler(instanceSql));
 
-  sql.onUnknownSqlError(onUnknownSqlError);
+  instanceSql.onUnknownSqlError(onUnknownSqlError);
 
   return { ok: true, error: undefined };
 }
@@ -2078,6 +2206,14 @@ app.commandLine.appendSwitch('disable-features', featuresToDisable);
 resolveTranslationsLocale();
 app.commandLine.appendSwitch('lang', getResolvedMessagesLocale().name);
 
+// On Linux the GPU subprocess is killed by the seccomp sandbox on musl-based
+// distros (Void, Alpine) because musl uses different syscalls than glibc.
+// Chromium retries 3 times then kills the main process with SIGFPE/SIGTRAP.
+// Running GPU in-process eliminates the subprocess and the cascade crash.
+if (process.platform === 'linux') {
+  app.commandLine.appendSwitch('in-process-gpu');
+}
+
 // This has to run before the 'ready' event.
 electronProtocol.registerSchemesAsPrivileged([
   {
@@ -2107,7 +2243,9 @@ app.on('ready', async () => {
     dns.setIPv6Enabled(false);
   }
 
-  const [userDataPath, crashDumpsPath, installPath] = await Promise.all([
+  let crashDumpsPath: string;
+  let installPath: string;
+  [userDataPath, crashDumpsPath, installPath] = await Promise.all([
     realpath(app.getPath('userData')),
     realpath(app.getPath('crashDumps')),
     realpath(rootDir),
@@ -2147,7 +2285,31 @@ app.on('ready', async () => {
 
   resolveTranslationsLocale();
 
-  sqlInitPromise = initializeSQL(userDataPath);
+  // Multi-account: load the active account (or create the default entry
+  // on first run so the existing db at userDataPath is used directly).
+  const activeAccount = ensureDefaultAccountRegistered();
+  activeAccountId = activeAccount.id;
+  const accountConfigDir = activeAccount.path || userDataPath;
+  log.info(`multi-account: using configDir: ${accountConfigDir}`);
+
+  // Create a SQL instance for the active account and set the module-level
+  // reference so that ZoomFactorService, getIsLinked, etc. still work.
+  const activeSql = new MainSQL();
+  sql = activeSql;
+
+  const activeSqlInitPromise = initializeSQL(
+    activeSql,
+    accountConfigDir,
+    activeAccount.path ? getAccountSQLKey(accountConfigDir) : undefined
+  );
+  sqlInitPromise = activeSqlInitPromise;
+
+  // Always use the default Electron session for the main window.
+  // Per-account isolation is at the filesystem level (different configDir/SQL),
+  // not at the Electron session level. Using session.fromPartition() creates a
+  // fresh empty session that causes Signal to treat itself as a new install and
+  // report the app version as out-of-date.
+  const activeSess = session.defaultSession;
 
   // First run: configure Signal to minimize to tray. Additionally, on Windows
   // enable auto-start with start-in-tray so that starting from a Desktop icon
@@ -2348,13 +2510,31 @@ app.on('ready', async () => {
     );
   }
 
-  // Initialize IPC channels before creating the window
-
-  attachmentChannel.initialize({
-    sql,
-    configDir: userDataPath,
+  // Initialize IPC channels before creating any windows.
+  // Handlers route by event.sender.id — no global sql/dirs reference needed.
+  attachmentChannel.initializeIPC();
+  sqlChannels.initialize({
+    eraseKeyForWindow: webContentsId => {
+      // Erase only the key material for the account that owns this window.
+      const accId = webContentsToAccount.get(webContentsId);
+      const entry = accId ? getAccountById(accId) : undefined;
+      if (entry?.path) {
+        // Non-default account: its key lives in account-key.json.
+        try {
+          fsExtra.rmSync(join(entry.path, 'account-key.json'), { force: true });
+        } catch (err) {
+          log.error(
+            'multi-account: failed to erase account key:',
+            Errors.toLogFormat(err)
+          );
+        }
+        return;
+      }
+      // Default account (path === '') or unknown window: erase global config.
+      userConfig.remove();
+      ephemeralConfig.remove();
+    },
   });
-  sqlChannels.initialize(sql);
   PowerChannel.initialize({
     send(event) {
       if (!mainWindow) {
@@ -2366,8 +2546,19 @@ app.on('ready', async () => {
 
   appStartInitialSpellcheckSetting = await getSpellCheckSetting();
 
-  // Run window preloading in parallel with database initialization.
-  await createWindow();
+  // Create the active account's window (uses saved window config for size/pos).
+  await createWindow({ sess: activeSess });
+
+  // Register the main window in multi-account maps so IPC routing works.
+  if (mainWindow) {
+    sqlChannels.registerWindow(mainWindow.webContents.id, activeSql);
+    webContentsToAccount.set(mainWindow.webContents.id, activeAccount.id);
+    accountWindows.set(activeAccount.id, {
+      window: mainWindow,
+      sql: activeSql,
+    });
+    sqlInitPromises.set(mainWindow.webContents.id, activeSqlInitPromise);
+  }
 
   const { error: sqlError } = await sqlInitPromise;
   if (sqlError) {
@@ -2377,6 +2568,30 @@ app.on('ready', async () => {
 
     return;
   }
+
+  // SQL is ready — register the attachment:// protocol for the active session.
+  if (mainWindow) {
+    attachmentChannel.initializeForSession(
+      activeSess,
+      mainWindow.webContents.id,
+      accountConfigDir,
+      activeSql
+    );
+  }
+
+  // Register a renderer restart handler so that recoverable crashes (renderer
+  // killed by Chromium's hang detector) reload the page instead of quitting.
+  GlobalErrors.registerRendererRestartHandler(async crashedWebContents => {
+    // Only restart the main window's renderer; ignore crashes from other
+    // webContents (e.g. the screen-share or about windows).
+    if (!mainWindow || crashedWebContents !== mainWindow.webContents) {
+      return false;
+    }
+    log.warn('global_errors: reloading renderer after recoverable crash');
+    const url = prepareFileUrl([rootDir, 'background.html']);
+    await safeLoadURL(mainWindow, url);
+    return true;
+  });
 
   try {
     const IDB_KEY = 'indexeddb-delete-needed';
@@ -2853,6 +3068,251 @@ ipc.handle(
   }
 );
 
+// Multi-account: renderer notifies main process when registration/linking
+// completes so we can update the account's display name in the registry.
+ipc.on(
+  'multi-account:registration-complete',
+  (event: Electron.IpcMainEvent, phoneNumber: unknown) => {
+    if (typeof phoneNumber === 'string' && phoneNumber.length > 0) {
+      log.info('multi-account: registration complete, updating registry');
+      const accountId = webContentsToAccount.get(event.sender.id);
+      notifyActiveAccountRegistered(phoneNumber, accountId);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Multi-account: in-place account switching (single process, renderer reload)
+// ---------------------------------------------------------------------------
+
+/**
+ * Switch to the given account by closing the current SQL workers, updating
+ * the active account in the registry, reinitializing SQL + attachment paths
+ * with the new account's data directory, and reloading the renderer.
+ */
+async function performAccountSwitch(accountId: string): Promise<void> {
+  const entry = getAccountById(accountId);
+  if (!entry) {
+    log.error(`multi-account: unknown account ${accountId}`);
+    return;
+  }
+
+  // Ignore overlapping switches: two concurrent calls would both close/reopen
+  // the same MainSQL and could race two SQLite handles onto one DB file.
+  if (accountSwitchInProgress) {
+    log.warn('multi-account: switch already in progress, ignoring request');
+    return;
+  }
+  if (accountId === activeAccountId) {
+    log.info('multi-account: already on requested account, ignoring');
+    return;
+  }
+  accountSwitchInProgress = true;
+  try {
+    await doAccountSwitch(accountId, entry);
+  } finally {
+    accountSwitchInProgress = false;
+  }
+}
+
+async function doAccountSwitch(
+  accountId: string,
+  entry: AccountEntry
+): Promise<void> {
+  const previousAccountId = activeAccountId;
+  const newConfigDir = entry.path || userDataPath;
+  log.info(
+    `multi-account: switching to ${entry.id}, configDir=${newConfigDir}`
+  );
+
+  // Close current SQL workers.
+  try {
+    await sql.close();
+  } catch (err) {
+    log.error('multi-account: error closing sql:', Errors.toLogFormat(err));
+  }
+
+  setActiveAccount(accountId);
+  activeAccountId = accountId;
+
+  const newKey = entry.path ? getAccountSQLKey(newConfigDir) : getSQLKey();
+  const newSql = new MainSQL();
+  sql = newSql;
+
+  try {
+    await newSql.initialize({
+      appVersion: app.getVersion(),
+      configDir: newConfigDir,
+      key: newKey,
+      logger: log,
+    });
+  } catch (err) {
+    log.error(
+      'multi-account: error initializing sql:',
+      Errors.toLogFormat(err)
+    );
+    return;
+  }
+
+  // Let the database-ready handler resolve immediately with success.
+  const initP = Promise.resolve({ ok: true as const, error: undefined });
+  sqlInitPromise = initP;
+
+  newSql.startTrackingQueryStats();
+  drop(runSQLCorruptionHandler(newSql));
+  drop(runSQLReadonlyHandler(newSql));
+  newSql.onUnknownSqlError(onUnknownSqlError);
+
+  // Re-register the same webContentsId with the new SQL + new attachment dirs.
+  if (mainWindow) {
+    const wcId = mainWindow.webContents.id;
+    sqlChannels.unregisterWindow(wcId);
+    sqlChannels.registerWindow(wcId, newSql);
+    attachmentChannel.unregisterWindow(wcId);
+    attachmentChannel.initializeForSession(
+      mainWindow.webContents.session,
+      wcId,
+      newConfigDir,
+      newSql
+    );
+    // Drop the previous account's entry for this window so it doesn't linger
+    // pointing at the now-closed SQL instance.
+    if (previousAccountId && previousAccountId !== accountId) {
+      accountWindows.delete(previousAccountId);
+    }
+    accountWindows.set(accountId, { window: mainWindow, sql: newSql });
+    webContentsToAccount.set(wcId, accountId);
+    sqlInitPromises.set(wcId, initP);
+  }
+
+  // Reload the renderer in-place (same window, same process).
+  // Use safeLoadURL (same as initial window load) to handle the spurious
+  // ERR_FAILED (-2) that Electron raises when the current page's
+  // did-stop-loading fires during a programmatic navigation.
+  if (mainWindow) {
+    const url = prepareFileUrl([rootDir, 'background.html']);
+    await safeLoadURL(mainWindow, url);
+  }
+}
+
+/**
+ * Create a fresh account directory + registry entry, spin up a background
+ * window for it, and switch to it. The renderer will show the setup screen.
+ */
+async function performAccountAdd(): Promise<void> {
+  const accountId = generateAccountId();
+  const accountPath = join(userDataPath, 'accounts', accountId);
+  fsExtra.mkdirSync(accountPath, { recursive: true });
+
+  const newEntry: AccountEntry = {
+    id: accountId,
+    path: accountPath,
+    displayName: 'New Account',
+    addedAt: Date.now(),
+    isActive: false,
+  };
+  addAccount(newEntry);
+
+  await performAccountSwitch(accountId);
+}
+
+// Multi-account: in-app account switcher IPC handlers.
+ipc.handle('multi-account:get-list', event => {
+  // isCurrent is relative to the window that asked, not the global active flag.
+  const requestingAccountId = webContentsToAccount.get(event.sender.id);
+  return getAllAccounts()
+    .filter(entry => entry.isActive || entry.phoneNumber != null)
+    .map(entry => ({
+      id: entry.id,
+      displayName: entry.displayName,
+      color: entry.color,
+      isCurrent: entry.id === requestingAccountId,
+      avatarUrl: entry.avatarPath ? `file://${entry.avatarPath}` : undefined,
+    }));
+});
+
+// Cache the current account's avatar bytes so the account switcher can show
+// the pfp for non-active accounts.
+ipc.handle(
+  'multi-account:cache-avatar',
+  async (event, buffer: Uint8Array<ArrayBuffer>) => {
+    // Cap the renderer-supplied buffer so a misbehaving/compromised renderer
+    // can't write an arbitrarily large file to disk. Avatars are small JPEGs.
+    const MAX_AVATAR_BYTES = 512 * 1024;
+    if (
+      !(buffer instanceof Uint8Array) ||
+      buffer.byteLength > MAX_AVATAR_BYTES
+    ) {
+      log.warn('multi-account: rejecting oversized/invalid avatar buffer');
+      return;
+    }
+    const accountId = webContentsToAccount.get(event.sender.id);
+    if (!accountId) return;
+    const entry = getAccountById(accountId);
+    if (!entry) return;
+    const configDir = entry.path || userDataPath;
+    const avatarPath = join(configDir, 'account-avatar.jpg');
+    try {
+      await writeFile(avatarPath, Buffer.from(buffer));
+      updateAccount(accountId, { avatarPath });
+    } catch (err) {
+      log.error(
+        'multi-account: failed to cache avatar:',
+        Errors.toLogFormat(err)
+      );
+    }
+  }
+);
+
+ipc.on(
+  'multi-account:update-profile',
+  (event: Electron.IpcMainEvent, displayName: unknown, color: unknown) => {
+    if (typeof displayName !== 'string' || !displayName) {
+      return;
+    }
+    // Update the account for the window that sent this, not the global active.
+    const accountId =
+      webContentsToAccount.get(event.sender.id) ?? getActiveAccount()?.id;
+    if (!accountId) {
+      return;
+    }
+    updateAccount(accountId, {
+      displayName,
+      ...(typeof color === 'string' ? { color } : undefined),
+    });
+  }
+);
+
+ipc.on(
+  'multi-account:switch',
+  (_event: Electron.IpcMainEvent, accountId: unknown) => {
+    if (typeof accountId !== 'string') {
+      return;
+    }
+    drop(performAccountSwitch(accountId));
+  }
+);
+
+ipc.on('multi-account:add', () => {
+  drop(performAccountAdd());
+});
+
+ipc.on(
+  'multi-account:remove',
+  (_event: Electron.IpcMainEvent, accountId: unknown) => {
+    if (typeof accountId !== 'string') {
+      return;
+    }
+    const entry = getAccountById(accountId);
+    if (!entry || entry.id === activeAccountId) {
+      // Don't remove the currently active account.
+      return;
+    }
+    log.info(`multi-account: removing account ${accountId}`);
+    removeAccount(accountId);
+  }
+);
+
 // Settings-related IPC calls
 
 function addDarkOverlay() {
@@ -2937,6 +3397,14 @@ ipc.on('get-config', async event => {
     homePath: app.getPath('home'),
     installPath: rootDir,
     userDataPath: app.getPath('userData'),
+    accountConfigDir: (() => {
+      // Each window gets its own account's configDir, not the global active.
+      const senderAccountId = webContentsToAccount.get(event.sender.id);
+      const senderAccount = senderAccountId
+        ? getAccountById(senderAccountId)
+        : getActiveAccount();
+      return senderAccount?.path || app.getPath('userData');
+    })(),
 
     directoryConfig: directoryConfig.data,
 
@@ -3129,12 +3597,12 @@ async function ensureFilePermissions(onlyFiles?: Array<string>) {
   log.info('Begin ensuring permissions');
 
   const start = Date.now();
-  const userDataPath = await realpath(app.getPath('userData'));
-  const userDataGlob = attachments.prepareGlobPattern(userDataPath);
+  const localUserDataPath = await realpath(app.getPath('userData'));
+  const userDataGlob = attachments.prepareGlobPattern(localUserDataPath);
 
   // Determine files to touch
   const files = onlyFiles
-    ? onlyFiles.map(f => join(userDataPath, f))
+    ? onlyFiles.map(f => join(localUserDataPath, f))
     : await fastGlob(userDataGlob, {
         markDirectories: true,
         onlyFiles: false,

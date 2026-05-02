@@ -75,6 +75,8 @@ export const rendererConfigSchema = z.object({
   updatesUrl: configRequiredStringSchema,
   resourcesUrl: configRequiredStringSchema,
   userDataPath: configRequiredStringSchema,
+  /** Per-account data directory. Same as userDataPath for the default account. */
+  accountConfigDir: configRequiredStringSchema,
   version: configRequiredStringSchema,
   directoryConfig: directoryConfigSchema,
 

@@ -7,7 +7,7 @@ import {
   ValidatingPassThrough,
   inferChunkSize,
 } from '@signalapp/libsignal-client/dist/incremental_mac.js';
-import { ipcMain, protocol } from 'electron';
+import { ipcMain } from 'electron';
 import { LRUCache } from 'lru-cache';
 import { randomBytes } from 'node:crypto';
 import { once } from 'node:events';
@@ -537,60 +537,87 @@ function deleteOrphanedAttachments({
   return runSafe();
 }
 
-let attachmentsDir: string | undefined;
-let stickersDir: string | undefined;
-let tempDir: string | undefined;
-let draftDir: string | undefined;
-let downloadsDir: string | undefined;
-let avatarDataDir: string | undefined;
-
-export function initialize({
-  configDir,
-  sql,
-}: {
+type DirsType = Readonly<{
   configDir: string;
+  attachmentsDir: string;
+  stickersDir: string;
+  tempDir: string;
+  draftDir: string;
+  downloadsDir: string;
+  avatarDataDir: string;
+}>;
+
+type WindowAttachmentEntry = Readonly<{
+  dirs: DirsType;
   sql: MainSQL;
-}): void {
+}>;
+
+/**
+ * Per-window attachment state, keyed by webContents ID.
+ * Populated by initializeForSession(), cleared by unregisterWindow().
+ */
+const windowAttachmentMap = new Map<number, WindowAttachmentEntry>();
+
+function computeDirs(configDir: string): DirsType {
+  return {
+    configDir,
+    attachmentsDir: getAttachmentsPath(configDir),
+    stickersDir: getStickersPath(configDir),
+    tempDir: getTempPath(configDir),
+    draftDir: getDraftPath(configDir),
+    downloadsDir: getDownloadsPath(configDir),
+    avatarDataDir: getAvatarsPath(configDir),
+  };
+}
+
+/**
+ * Register IPC handlers once. Must be called before any account windows open.
+ * Handlers route by event.sender.id to the correct account's dirs/sql.
+ */
+export function initializeIPC(): void {
   if (initialized) {
-    throw new Error('initialize: Already initialized!');
+    throw new Error('attachment_channel: IPC already initialized!');
   }
   initialized = true;
 
-  attachmentsDir = getAttachmentsPath(configDir);
-  stickersDir = getStickersPath(configDir);
-  tempDir = getTempPath(configDir);
-  draftDir = getDraftPath(configDir);
-  downloadsDir = getDownloadsPath(configDir);
-  avatarDataDir = getAvatarsPath(configDir);
-
-  ipcMain.handle(ERASE_TEMP_KEY, () => {
-    strictAssert(tempDir != null, 'not initialized');
-    rmSync(tempDir);
+  ipcMain.handle(ERASE_TEMP_KEY, event => {
+    const entry = windowAttachmentMap.get(event.sender.id);
+    strictAssert(entry != null, 'ERASE_TEMP: no entry for this window');
+    rmSync(entry.dirs.tempDir);
   });
-  ipcMain.handle(ERASE_ATTACHMENTS_KEY, () => {
-    strictAssert(attachmentsDir != null, 'not initialized');
-    rmSync(attachmentsDir, { recursive: true, force: true });
+  ipcMain.handle(ERASE_ATTACHMENTS_KEY, event => {
+    const entry = windowAttachmentMap.get(event.sender.id);
+    strictAssert(entry != null, 'ERASE_ATTACHMENTS: no entry for this window');
+    rmSync(entry.dirs.attachmentsDir, { recursive: true, force: true });
   });
-  ipcMain.handle(ERASE_STICKERS_KEY, () => {
-    strictAssert(stickersDir != null, 'not initialized');
-    rmSync(stickersDir, { recursive: true, force: true });
+  ipcMain.handle(ERASE_STICKERS_KEY, event => {
+    const entry = windowAttachmentMap.get(event.sender.id);
+    strictAssert(entry != null, 'ERASE_STICKERS: no entry for this window');
+    rmSync(entry.dirs.stickersDir, { recursive: true, force: true });
   });
-  ipcMain.handle(ERASE_DRAFTS_KEY, () => {
-    strictAssert(draftDir != null, 'not initialized');
-    rmSync(draftDir, { recursive: true, force: true });
+  ipcMain.handle(ERASE_DRAFTS_KEY, event => {
+    const entry = windowAttachmentMap.get(event.sender.id);
+    strictAssert(entry != null, 'ERASE_DRAFTS: no entry for this window');
+    rmSync(entry.dirs.draftDir, { recursive: true, force: true });
   });
-  ipcMain.handle(ERASE_DOWNLOADS_KEY, () => {
-    strictAssert(downloadsDir != null, 'not initialized');
-    rmSync(downloadsDir, { recursive: true, force: true });
+  ipcMain.handle(ERASE_DOWNLOADS_KEY, event => {
+    const entry = windowAttachmentMap.get(event.sender.id);
+    strictAssert(entry != null, 'ERASE_DOWNLOADS: no entry for this window');
+    rmSync(entry.dirs.downloadsDir, { recursive: true, force: true });
   });
 
   ipcMain.handle(
     CLEANUP_ORPHANED_ATTACHMENTS_KEY,
-    async (_event, { _block }) => {
+    async (event, { _block }) => {
+      const entry = windowAttachmentMap.get(event.sender.id);
+      strictAssert(
+        entry != null,
+        'CLEANUP_ORPHANED_ATTACHMENTS: no entry for this window'
+      );
       const start = Date.now();
       await cleanupOrphanedAttachments({
-        sql,
-        userDataPath: configDir,
+        sql: entry.sql,
+        userDataPath: entry.dirs.configDir,
         _block,
       });
       const duration = Date.now() - start;
@@ -598,17 +625,67 @@ export function initialize({
     }
   );
 
-  ipcMain.handle(CLEANUP_DOWNLOADS_KEY, async () => {
+  ipcMain.handle(CLEANUP_DOWNLOADS_KEY, async event => {
+    const entry = windowAttachmentMap.get(event.sender.id);
+    strictAssert(entry != null, 'CLEANUP_DOWNLOADS: no entry for this window');
     const start = Date.now();
-    await deleteStaleDownloads(configDir);
+    await deleteStaleDownloads(entry.dirs.configDir);
     const duration = Date.now() - start;
     log.info(`cleanupDownloads: took ${duration}ms`);
   });
-
-  protocol.handle('attachment', handleAttachmentRequest);
 }
 
-export async function handleAttachmentRequest(req: Request): Promise<Response> {
+/**
+ * Register the attachment:// protocol on a specific Electron session and
+ * store the dirs/sql reference for IPC handler routing. Call once per
+ * account window after creating its BrowserWindow.
+ */
+export function initializeForSession(
+  sess: Electron.Session,
+  webContentsId: number,
+  configDir: string,
+  sql: MainSQL
+): void {
+  const dirs = computeDirs(configDir);
+  windowAttachmentMap.set(webContentsId, { dirs, sql });
+  // Unhandle first in case the protocol was already registered on this session
+  // (e.g. when switching accounts reuses the same session.defaultSession).
+  try {
+    sess.protocol.unhandle('attachment');
+  } catch {
+    /* not registered yet */
+  }
+  sess.protocol.handle('attachment', req => handleAttachmentRequest(req, dirs));
+}
+
+/** Remove the attachment entry when a window is destroyed. */
+export function unregisterWindow(webContentsId: number): void {
+  windowAttachmentMap.delete(webContentsId);
+}
+
+/**
+ * Convenience wrapper used by code that only has a webContentsId (e.g. the
+ * spell-check context menu "Copy Image" handler). Looks up dirs by window.
+ */
+export function handleAttachmentRequestForWindow(
+  req: Request,
+  webContentsId: number
+): Promise<Response> {
+  const entry = windowAttachmentMap.get(webContentsId);
+  if (!entry) {
+    return Promise.resolve(
+      new Response('No attachment handler registered for this window', {
+        status: 503,
+      })
+    );
+  }
+  return handleAttachmentRequest(req, entry.dirs);
+}
+
+export async function handleAttachmentRequest(
+  req: Request,
+  dirs: DirsType
+): Promise<Response> {
   const url = new URL(req.url);
   if (url.host !== 'v1' && url.host !== 'v2') {
     return new Response('Unknown host', { status: 404 });
@@ -621,32 +698,25 @@ export async function handleAttachmentRequest(req: Request): Promise<Response> {
     disposition = parseLoose(dispositionSchema, dispositionParam);
   }
 
-  strictAssert(attachmentsDir != null, 'not initialized');
-  strictAssert(tempDir != null, 'not initialized');
-  strictAssert(downloadsDir != null, 'not initialized');
-  strictAssert(draftDir != null, 'not initialized');
-  strictAssert(stickersDir != null, 'not initialized');
-  strictAssert(avatarDataDir != null, 'not initialized');
-
   let parentDir: string;
   switch (disposition) {
     case 'attachment':
-      parentDir = attachmentsDir;
+      parentDir = dirs.attachmentsDir;
       break;
     case 'download':
-      parentDir = downloadsDir;
+      parentDir = dirs.downloadsDir;
       break;
     case 'temporary':
-      parentDir = tempDir;
+      parentDir = dirs.tempDir;
       break;
     case 'draft':
-      parentDir = draftDir;
+      parentDir = dirs.draftDir;
       break;
     case 'sticker':
-      parentDir = stickersDir;
+      parentDir = dirs.stickersDir;
       break;
     case 'avatarData':
-      parentDir = avatarDataDir;
+      parentDir = dirs.avatarDataDir;
       break;
     default:
       throw missingCaseError(disposition);
