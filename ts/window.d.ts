@@ -72,6 +72,28 @@ export type IPCType = {
   stopTrackingQueryStats: (options?: QueryStatsOptions) => void;
   titleBarDoubleClick: () => void;
   updateTrayIcon: (count: number) => void;
+  /** Multi-account: notify main process that this account has completed registration. */
+  notifyRegistrationComplete: (phoneNumber: string) => void;
+  /** Multi-account: get all registered accounts. */
+  getAccountsList: () => Promise<
+    ReadonlyArray<{
+      id: string;
+      displayName: string;
+      color?: string;
+      isCurrent: boolean;
+      avatarUrl?: string;
+    }>
+  >;
+  /** Multi-account: reload this window as a different account. */
+  switchToAccount: (accountId: string) => void;
+  /** Multi-account: create a new account and reload as the setup screen. */
+  addAccount: () => void;
+  /** Multi-account: remove a non-current account from the registry. */
+  removeAccount: (accountId: string) => void;
+  /** Multi-account: persist profile name and color to the registry. */
+  updateAccountProfile: (displayName: string, color?: string) => void;
+  /** Multi-account: cache the current account's avatar for non-active display. */
+  cacheAccountAvatar: (buffer: Uint8Array<ArrayBuffer>) => Promise<void>;
 };
 
 export type FeatureFlagType = {

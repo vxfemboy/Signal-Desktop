@@ -196,6 +196,7 @@ export type NavTabsProps = Readonly<{
   navTabsCollapsed: boolean;
   onChangeLocation: (location: Location) => void;
   onToggleNavTabsCollapse: (collapsed: boolean) => void;
+  renderAccountSwitcher?: () => ReactNode;
   renderCallsTab: () => ReactNode;
   renderChatsTab: () => ReactNode;
   renderStoriesTab: () => ReactNode;
@@ -214,6 +215,7 @@ export function NavTabs({
   navTabsCollapsed,
   onChangeLocation,
   onToggleNavTabsCollapse,
+  renderAccountSwitcher,
   renderCallsTab,
   renderChatsTab,
   renderStoriesTab,
@@ -314,6 +316,9 @@ export function NavTabs({
             hasPendingUpdate={hasPendingUpdate}
           />
         </TabList>
+        {renderAccountSwitcher != null && (
+          <div className="NavTabs__Misc">{renderAccountSwitcher()}</div>
+        )}
       </nav>
       <TabPanel id={NavTab.Chats} className="NavTabs__TabPanel">
         {renderChatsTab}

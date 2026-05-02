@@ -43,6 +43,10 @@ ts/protobuf/*.d.ts
 # CSS Modules
 **/*.scss.d.ts
 
+# Local-only files
+.env
+CLAUDE.md
+
 # Editors
 /.idea
 /.vscode

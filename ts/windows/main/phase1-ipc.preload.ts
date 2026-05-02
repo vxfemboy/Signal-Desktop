@@ -181,6 +181,16 @@ const IPC: IPCType = {
     ipc.send('title-bar-double-click');
   },
   updateTrayIcon: unreadCount => ipc.send('update-tray-icon', unreadCount),
+  notifyRegistrationComplete: phoneNumber =>
+    ipc.send('multi-account:registration-complete', phoneNumber),
+  getAccountsList: () => ipc.invoke('multi-account:get-list'),
+  switchToAccount: accountId => ipc.send('multi-account:switch', accountId),
+  addAccount: () => ipc.send('multi-account:add'),
+  removeAccount: accountId => ipc.send('multi-account:remove', accountId),
+  updateAccountProfile: (displayName, color) =>
+    ipc.send('multi-account:update-profile', displayName, color),
+  cacheAccountAvatar: (buffer: Uint8Array<ArrayBuffer>) =>
+    ipc.invoke('multi-account:cache-avatar', buffer),
   whenWindowVisible,
 };
 

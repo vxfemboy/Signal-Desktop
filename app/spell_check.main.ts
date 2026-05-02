@@ -12,7 +12,7 @@ import type { LocalizerType } from '../ts/types/Util.std.ts';
 import { strictAssert } from '../ts/util/assert.std.ts';
 import type { LoggerType } from '../ts/types/Logging.std.ts';
 import { createLogger } from '../ts/logging/log.std.ts';
-import { handleAttachmentRequest } from './attachment_channel.main.ts';
+import { handleAttachmentRequestForWindow } from './attachment_channel.main.ts';
 
 const log = createLogger('spell_check');
 
@@ -172,7 +172,10 @@ export const setup = (
             });
 
             try {
-              const res = await handleAttachmentRequest(req);
+              const res = await handleAttachmentRequestForWindow(
+                req,
+                browserWindow.webContents.id
+              );
               if (!res.ok) {
                 return;
               }
