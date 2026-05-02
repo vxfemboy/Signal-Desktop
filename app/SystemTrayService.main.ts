@@ -153,6 +153,7 @@ export class SystemTrayService {
     // context menu, since the 'click' event may not work on all platforms.
     // For details please refer to:
     // https://github.com/electron/electron/blob/master/docs/api/tray.md.
+
     tray.setContextMenu(
       Menu.buildFromTemplate([
         {
