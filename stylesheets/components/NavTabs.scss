@@ -180,6 +180,13 @@ $NavTabs__ProfileAvatar__size: 28px;
   }
 }
 
+.NavTabs__ItemIcon--AccountSwitcher {
+  @include NavTabs__Icon('../images/icons/v3/person/person.svg');
+  .NavTabs__Item:active & {
+    @include NavTabs__Icon('../images/icons/v3/person/person-compact.svg');
+  }
+}
+
 .NavTabs__ItemIconLabel {
   @include mixins.sr-only;
 }

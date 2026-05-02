@@ -1103,6 +1103,26 @@
     "messageformat": "Quit",
     "description": "Command in the tray icon menu, to quit the application"
   },
+  "icu:multiAccount__addAccount": {
+    "messageformat": "Add Account",
+    "description": "Option in the in-app account switcher menu to add a new Signal account"
+  },
+  "icu:multiAccount__accounts": {
+    "messageformat": "Accounts",
+    "description": "Heading for the in-app account switcher menu"
+  },
+  "icu:multiAccount__accountSwitcher": {
+    "messageformat": "Switch Account",
+    "description": "Aria label for the account switcher button in the nav sidebar"
+  },
+  "icu:multiAccount__removeAccount": {
+    "messageformat": "Remove Account",
+    "description": "Option in the per-account sub-menu to remove that account from the switcher"
+  },
+  "icu:multiAccount__switchToAccount": {
+    "messageformat": "Switch to this account",
+    "description": "Option in the per-account sub-menu to switch to that account"
+  },
   "icu:signalDesktop": {
     "messageformat": "Signal Desktop",
     "description": "Tooltip for the tray icon"
