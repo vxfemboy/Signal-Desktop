@@ -11,8 +11,9 @@ import * as Errors from '../ts/types/errors.std.ts';
 import OS from '../ts/util/os/osMain.node.ts';
 
 let userData: string | undefined;
-// Use separate data directory for benchmarks & development
+
 if (config.has('storagePath')) {
+  // Use separate data directory for benchmarks & development
   userData = String(config.get('storagePath'));
 } else if (config.has('storageProfile')) {
   userData = join(
