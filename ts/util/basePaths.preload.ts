@@ -12,7 +12,7 @@ import {
   getMegaphonesPath,
 } from '../../app/attachments.node.ts';
 
-const userDataPath = window.SignalContext.getPath('userData');
+const userDataPath = window.SignalContext.config.accountConfigDir;
 
 export const ATTACHMENTS_PATH = getAttachmentsPath(userDataPath);
 export const DRAFT_PATH = getDraftPath(userDataPath);

@@ -2107,6 +2107,14 @@ async function startApp(): Promise<void> {
     await Promise.all([waitForAllBatchers(), flushAllWaitBatchers()]);
     log.info('onEmpty: All outstanding database requests complete');
     window.IPC.readyForUpdates();
+
+    // Multi-account: notify the main process of this account's phone number so
+    // it can update the shared accounts registry with the correct display name.
+    const registeredNumber = itemStorage.user.getNumber();
+    if (registeredNumber) {
+      window.IPC.notifyRegistrationComplete(registeredNumber);
+    }
+
     window.ConversationController.onEmpty();
 
     // Start listeners here, after we get through our queue.
