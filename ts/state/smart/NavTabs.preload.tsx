@@ -5,6 +5,7 @@ import { memo, useCallback } from 'react';
 import type { ReactNode, JSX } from 'react';
 import { useSelector } from 'react-redux';
 import { NavTabs } from '../../components/NavTabs.dom.tsx';
+import { SmartAccountSwitcherMenu } from './AccountSwitcherMenu.dom.tsx';
 import { getIntl } from '../selectors/user.std.ts';
 import { getAllConversationsUnreadStats } from '../selectors/conversations.dom.ts';
 import {
@@ -66,6 +67,7 @@ export const SmartNavTabs = memo(function SmartNavTabs({
       navTabsCollapsed={navTabsCollapsed}
       onChangeLocation={onChangeLocation}
       onToggleNavTabsCollapse={onToggleNavTabsCollapse}
+      renderAccountSwitcher={() => <SmartAccountSwitcherMenu />}
       renderCallsTab={renderCallsTab}
       renderChatsTab={renderChatsTab}
       renderStoriesTab={renderStoriesTab}
