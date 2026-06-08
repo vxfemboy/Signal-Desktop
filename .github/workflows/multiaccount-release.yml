@@ -1,0 +1,242 @@
+# Copyright 2024 Signal Messenger, LLC
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Tracks stable upstream signalapp/Signal-Desktop releases and, for each new
+# stable tag, replays the multi-account patch (the single commit on
+# `feature/multi-account`, on top of the tag recorded in
+# .github/multiaccount-base.txt) onto that tag, builds the Linux app, and
+# publishes a per-release build on this fork. On merge conflict it files an
+# issue and skips the tag. See .claude/plans for the design rationale.
+
+name: Multi-account release
+
+on:
+  schedule:
+    # Daily at 13:00 UTC — upstream stable releases land roughly weekly.
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Specific upstream stable tag to build (e.g. v8.13.0). Leave empty to auto-discover new ones.'
+        required: false
+        type: string
+      max_tags:
+        description: 'Max number of newest unbuilt tags to build in one run.'
+        required: false
+        default: '3'
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: https://github.com/signalapp/Signal-Desktop.git
+
+jobs:
+  discover:
+    name: Discover new stable tags
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
+      newest: ${{ steps.compute.outputs.newest }}
+      any: ${{ steps.compute.outputs.any }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream tags
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch --quiet upstream --tags
+
+      - name: Compute tag matrix
+        id: compute
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          MAX_TAGS: ${{ inputs.max_tags || '3' }}
+        run: |
+          set -euo pipefail
+
+          # Stable upstream tags only: vMAJOR.MINOR.PATCH (no -alpha/-beta).
+          stable="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)"
+
+          # Tags already built on this fork are published as <tag>-multiaccount.
+          built="$(git ls-remote --tags origin '*-multiaccount' \
+            | sed -E 's#.*refs/tags/##; s/\^\{\}$//; s/-multiaccount$//' \
+            | sort -u || true)"
+
+          if [ -n "${INPUT_TAG}" ]; then
+            # Manual single-tag build. Validate it exists upstream.
+            if ! echo "$stable" | grep -qx "${INPUT_TAG}"; then
+              echo "::error::Requested tag ${INPUT_TAG} is not a known stable upstream tag"
+              exit 1
+            fi
+            selected="${INPUT_TAG}"
+          else
+            # New = stable tags not yet built, newest first, capped to MAX_TAGS.
+            new="$(comm -23 <(echo "$stable") <(echo "$built") | sort -V | tail -n "${MAX_TAGS}")"
+            selected="$new"
+          fi
+
+          selected="$(echo "$selected" | sed '/^$/d')"
+          if [ -z "$selected" ]; then
+            echo "No new stable tags to build."
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"tag\":[]}" >> "$GITHUB_OUTPUT"
+            echo "newest=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          newest="$(echo "$selected" | sort -V | tail -n1)"
+          json="$(echo "$selected" | sort -V | jq -R . | jq -cs '{tag: .}')"
+          echo "any=true" >> "$GITHUB_OUTPUT"
+          echo "newest=${newest}" >> "$GITHUB_OUTPUT"
+          echo "matrix=${json}" >> "$GITHUB_OUTPUT"
+          echo "Selected tags:"; echo "$selected"
+
+  build:
+    name: Build ${{ matrix.tag }}
+    needs: discover
+    if: needs.discover.outputs.any == 'true'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Fetch upstream tag
+        env:
+          TAG: ${{ matrix.tag }}
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch --quiet upstream tag "$TAG"
+
+      - name: Apply multi-account patch onto ${{ matrix.tag }}
+        id: apply
+        env:
+          TAG: ${{ matrix.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # The base tag the canonical branch currently sits on.
+          base="$(git show origin/feature/multi-account:.github/multiaccount-base.txt | tr -d '[:space:]')"
+          echo "Canonical base: ${base}; target: ${TAG}"
+
+          git checkout -B "multiaccount/${TAG}" "${TAG}"
+
+          if git cherry-pick "${base}..origin/feature/multi-account"; then
+            echo "applied=true" >> "$GITHUB_OUTPUT"
+          else
+            conflicts="$(git diff --name-only --diff-filter=U || true)"
+            git cherry-pick --abort || true
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+            echo "Conflicts applying multi-account onto ${TAG}:"
+            echo "$conflicts"
+
+            title="Multi-account rebase conflict on ${TAG}"
+            # Avoid duplicate issues for the same tag.
+            existing="$(gh issue list --state open --search "in:title ${title}" --json number --jq '.[0].number' || true)"
+            if [ -z "$existing" ]; then
+              body=$'Replaying the multi-account patch onto upstream `'"${TAG}"$'` hit merge conflicts.\n\n**Conflicted files:**\n```\n'"${conflicts}"$'\n```\n\nResolve locally, then push the updated `feature/multi-account` and bump `.github/multiaccount-base.txt`:\n```\ngit fetch upstream --tags\ngit rebase --onto '"${TAG}"' "$(cat .github/multiaccount-base.txt)" feature/multi-account\n# resolve, then:\nprintf "'"${TAG}"'\\n" > .github/multiaccount-base.txt\ngit add .github/multiaccount-base.txt && git commit --amend --no-edit\ngit push --force-with-lease origin feature/multi-account\n```\nThen re-run this workflow with tag='"${TAG}"'.'
+              gh issue create --title "$title" --body "$body" --label multi-account || true
+            else
+              echo "Issue #${existing} already open for ${TAG}, skipping."
+            fi
+          fi
+
+      - name: Setup pnpm
+        if: steps.apply.outputs.applied == 'true'
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4
+
+      - name: Setup Node.js
+        if: steps.apply.outputs.applied == 'true'
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+          cache-dependency-path: 'pnpm-lock.yaml'
+
+      - name: Install system deps
+        if: steps.apply.outputs.applied == 'true'
+        run: sudo apt-get update && sudo apt-get install -y xvfb libpulse0
+
+      - name: Install dependencies
+        if: steps.apply.outputs.applied == 'true'
+        env:
+          NPM_CONFIG_NODE_GYP: echo
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate assets
+        if: steps.apply.outputs.applied == 'true'
+        run: pnpm run generate
+
+      - name: Build Linux (.deb + unpacked dir)
+        if: steps.apply.outputs.applied == 'true'
+        run: pnpm run build:release --linux deb dir --publish=never
+
+      - name: Tests (best-effort, non-blocking)
+        if: steps.apply.outputs.applied == 'true'
+        continue-on-error: true
+        run: |
+          xvfb-run --auto-servernum pnpm run test-node
+          xvfb-run --auto-servernum pnpm run test-electron
+
+      - name: Package unpacked dir
+        if: steps.apply.outputs.applied == 'true'
+        env:
+          TAG: ${{ matrix.tag }}
+        run: |
+          tar -C release -czf "release/signal-desktop-multiaccount-${TAG}-linux-x64.tar.gz" linux-unpacked
+
+      - name: Push build branch
+        if: steps.apply.outputs.applied == 'true'
+        env:
+          TAG: ${{ matrix.tag }}
+        run: git push --force origin "multiaccount/${TAG}"
+
+      - name: Publish fork release
+        if: steps.apply.outputs.applied == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          notes="Multi-account build on top of upstream signalapp/Signal-Desktop \`${TAG}\`.
+
+          Built automatically from \`multiaccount/${TAG}\`. Linux x64 (glibc).
+          Assets: Debian package + unpacked tarball."
+          gh release create "${TAG}-multiaccount" \
+            --title "Multi-account ${TAG}" \
+            --notes "$notes" \
+            --target "multiaccount/${TAG}" \
+            release/*.deb \
+            "release/signal-desktop-multiaccount-${TAG}-linux-x64.tar.gz"
+
+      - name: Advance canonical branch (newest clean build only)
+        if: steps.apply.outputs.applied == 'true' && matrix.tag == needs.discover.outputs.newest
+        env:
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          # Move feature/multi-account onto the newest built tag and record the
+          # new base so future versions only resolve the inter-version delta.
+          printf '%s\n' "$TAG" > .github/multiaccount-base.txt
+          git add .github/multiaccount-base.txt
+          git commit --amend --no-edit
+          git branch -f feature/multi-account "multiaccount/${TAG}"
+          git push --force origin feature/multi-account
