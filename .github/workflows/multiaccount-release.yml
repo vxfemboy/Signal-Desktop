@@ -32,6 +32,10 @@ permissions:
 
 env:
   UPSTREAM_REPO: https://github.com/signalapp/Signal-Desktop.git
+  # Pin every `gh` invocation to this fork. Without this, gh can resolve the
+  # `upstream` remote (signalapp) as the default repo and 403 on release/issue
+  # creation.
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   discover:
