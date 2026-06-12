@@ -175,13 +175,18 @@ jobs:
           Linux x64 (glibc). Assets: Debian package + unpacked tarball.
           Built by the multi-account-release workflow."
           # Target the fork branch (already on the remote) so no workflow-file
-          # push is required. Assets carry the actual built app.
-          gh release create "${TAG}-multiaccount" \
-            --title "Multi-account ${TAG}" \
-            --notes "$notes" \
-            --target feature/multi-account \
-            release/*.deb \
-            "release/signal-desktop-multiaccount-${TAG}-linux-x64.tar.gz"
+          # push is required. Assets carry the actual built app. Idempotent:
+          # update assets if the release already exists (e.g. force rebuild).
+          assets=(release/*.deb "release/signal-desktop-multiaccount-${TAG}-linux-x64.tar.gz")
+          if gh release view "${TAG}-multiaccount" >/dev/null 2>&1; then
+            gh release upload "${TAG}-multiaccount" "${assets[@]}" --clobber
+          else
+            gh release create "${TAG}-multiaccount" \
+              --title "Multi-account ${TAG}" \
+              --notes "$notes" \
+              --target feature/multi-account \
+              "${assets[@]}"
+          fi
 
       - name: Advance canonical branch to ${{ needs.discover.outputs.tag }}
         # Rebase feature/multi-account onto the just-built tag so the branch
