@@ -81,7 +81,12 @@ jobs:
             selected="${INPUT_TAG}"
           else
             # New = stable tags not yet built, newest first, capped to MAX_TAGS.
-            new="$(comm -23 <(echo "$stable") <(echo "$built") | sort -V | tail -n "${MAX_TAGS}")"
+            # comm needs both inputs ordered by the SAME collation it verifies
+            # with — pin sort AND comm to LC_ALL=C, then version-sort the diff.
+            new="$(LC_ALL=C comm -23 \
+              <(printf '%s\n' "$stable" | LC_ALL=C sort -u) \
+              <(printf '%s\n' "$built" | LC_ALL=C sort -u) \
+              | sort -V | tail -n "${MAX_TAGS}")"
             selected="$new"
           fi
 
