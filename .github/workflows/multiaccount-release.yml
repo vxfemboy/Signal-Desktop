@@ -183,6 +183,30 @@ jobs:
             release/*.deb \
             "release/signal-desktop-multiaccount-${TAG}-linux-x64.tar.gz"
 
+      - name: Advance canonical branch to ${{ needs.discover.outputs.tag }}
+        # Rebase feature/multi-account onto the just-built tag so the branch
+        # source tracks upstream. Requires a PAT with `workflows` scope
+        # (secret MULTIACCOUNT_PAT) because the GITHUB_TOKEN cannot push
+        # .github/workflows changes. No PAT => skipped (release still stands).
+        continue-on-error: true
+        env:
+          PAT: ${{ secrets.MULTIACCOUNT_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAT:-}" ]; then
+            echo "MULTIACCOUNT_PAT not set — leaving branch on its current base." \
+                 "Build branch HEAD already tracks ${TAG}; the canonical branch" \
+                 "will only move when a PAT is configured or you advance locally."
+            exit 0
+          fi
+          # We're on build/<TAG> = <TAG> + the multi-account patch. Record the
+          # new base and move feature/multi-account to it.
+          printf '%s\n' "$TAG" > .github/multiaccount-base.txt
+          git add .github/multiaccount-base.txt
+          git commit -m "chore: advance multi-account base to ${TAG}"
+          git push --force "https://x-access-token:${PAT}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/feature/multi-account"
+
       - name: File an issue on failure
         if: failure()
         env:
