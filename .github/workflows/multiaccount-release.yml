@@ -200,10 +200,16 @@ jobs:
             exit 0
           fi
           # We're on build/<TAG> = <TAG> + the multi-account patch. Record the
-          # new base and move feature/multi-account to it.
+          # new base and move feature/multi-account to it. Skip the commit when
+          # the base is unchanged (e.g. a forced rebuild of the current tag) so
+          # the push still runs idempotently.
           printf '%s\n' "$TAG" > .github/multiaccount-base.txt
           git add .github/multiaccount-base.txt
-          git commit -m "chore: advance multi-account base to ${TAG}"
+          if git diff --cached --quiet; then
+            echo "Base already ${TAG}; pushing branch unchanged."
+          else
+            git commit -m "chore: advance multi-account base to ${TAG}"
+          fi
           git push --force "https://x-access-token:${PAT}@github.com/${GITHUB_REPOSITORY}.git" \
             "HEAD:refs/heads/feature/multi-account"
 
